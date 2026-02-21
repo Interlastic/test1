@@ -1,0 +1,11 @@
+{
+    "name": "Bot client",
+    "description": "client",
+    "authors": [
+        {
+            "name": "Interlastic",
+            "id": "0"
+        }
+    ],
+    "main": "src/index.tsx"
+}
