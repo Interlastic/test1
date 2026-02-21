@@ -1,484 +1,414 @@
 /**
- * BotLogin Plugin for Revenge/Shiggy
- * Allows logging in as a bot by manually connecting to Discord Gateway
+ * BotLogin Plugin for Revenge (Vendetta/Bunny-compatible)
+ * Correct API: window.vendetta
+ * - No DOM (React Native, not a browser)
+ * - No BdApi / BetterDiscord APIs
+ * - No localStorage → use vendetta.storage.createProxy
+ * - No alert() → use showToast / showConfirmationAlert
+ * - No document.createElement → use React Native components
+ * - Lifecycle: onLoad() / onUnload(), not start() / stop()
+ * - Settings UI: exported settings React component
  */
 
-module.exports = {
-    start() {
-        console.log('[BotLogin] Starting...');
-
-        // Store WebSocket and related state
-        this.ws = null;
-        this.heartbeatInterval = null;
-        this.sequence = null;
-        this.sessionId = null;
-        this.reconnectAttempts = 0;
-        this.isStopping = false; // Flag to prevent unwanted reconnects
-
-        // Find and patch necessary modules
-        this.findGatewayModule();
-        this.createSettingsUI();
-        this.patchTokenStorage();
-
-        console.log('[BotLogin] Started successfully!');
+const {
+    metro: { findByProps },
+    patcher,
+    storage: { createProxy },
+    ui: {
+        toasts: { showToast },
+        alerts: { showConfirmationAlert },
     },
+    React,
+    ReactNative: { View, Text, TextInput, TouchableOpacity, StyleSheet, ScrollView, Alert },
+} = window.vendetta;
 
-    stop() {
-        console.log('[BotLogin] Stopping...');
+// ─── Persistent Storage ───────────────────────────────────────────────────────
+// createProxy wraps an object in a reactive proxy backed by Revenge's file storage.
+// Reads/writes to it are automatically persisted across restarts.
+const storage = createProxy({
+    botToken: "",
+    intents: 3276799, // All common intents bitmask
+});
 
-        this.isStopping = true; // Set flag before closing
-        
-        // Disconnect if connected
-        if (this.ws) {
-            this.ws.close(1000, 'Plugin stopping'); // Clean close
-            this.ws = null;
-        }
-
-        // Clear heartbeat
-        if (this.heartbeatInterval) {
-            clearInterval(this.heartbeatInterval);
-            this.heartbeatInterval = null;
-        }
-
-        // Unpatch modules - Placeholder for actual unpatching logic
-        if (this.originalTokenStorage) {
-            // Restore original token storage if patched
-            this.originalTokenStorage = null;
-        }
-
-        // Remove UI
-        if (this.settingsButton) {
-            this.settingsButton.remove();
-        }
-
-        console.log('[BotLogin] Stopped!');
+// ─── Styles (React Native StyleSheet, not CSS) ────────────────────────────────
+const styles = StyleSheet.create({
+    container: {
+        flex: 1,
+        padding: 16,
+        backgroundColor: "#2b2d31",
     },
-
-    // Find the Gateway/Connection module in Webpack
-    findGatewayModule() {
-        // Search for gateway-related modules
-        // This is a common pattern - we look for modules that handle WebSocket connections
-        const modules = BdApi.Webpack.getModules(m =>
-            m.prototype && m.prototype.connect && m.prototype.disconnect
-        );
-        if (modules.length > 0) {
-            this.gatewayModule = modules[0];
-            console.log('[BotLogin] Found gateway module:', this.gatewayModule.name);
-        } else {
-            console.warn('[BotLogin] Could not find gateway module');
-        }
+    label: {
+        color: "#ffffff",
+        fontSize: 14,
+        marginBottom: 6,
+        fontWeight: "600",
     },
-
-    // Create a simple UI for bot token input
-    createSettingsUI() {
-        // Create a button in settings or add to existing mod settings
-        const settingsContainer = document.querySelector('.layer-86YKbF') || document.body;
-
-        this.settingsButton = document.createElement('button');
-        this.settingsButton.textContent = '🤖 Bot Login';
-        this.settingsButton.style.cssText = `
-            position: fixed;
-            top: 20px;
-            right: 20px;
-            z-index: 9999;
-            padding: 10px 20px;
-            background: #5865F2;
-            color: white;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-            font-size: 14px;
-        `;
-
-        this.settingsButton.onclick = () => this.showLoginModal();
-        settingsContainer.appendChild(this.settingsButton);
+    hint: {
+        color: "#aaaaaa",
+        fontSize: 12,
+        marginBottom: 14,
     },
-
-    // Show login modal
-    showLoginModal() {
-        const savedToken = localStorage.getItem('botlogin_token') || '';
-        const savedIntents = localStorage.getItem('botlogin_intents') || '3276799'; // Default all intents for common bots
-
-        const modal = document.createElement('div');
-        modal.style.cssText = `
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0,0,0,0.7);
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            z-index: 10000;
-        `;
-
-        modal.innerHTML = `
-            <div style="background: #2b2d31; padding: 20px; border-radius: 10px; width: 400px; max-width: 90%;">
-                <h2 style="color: white; margin-top: 0;">🤖 Bot Login</h2>
-                <p style="color: #ccc;">Enter your bot token and desired gateway intents.</p>
-                <div style="margin-bottom: 15px;">
-                    <label for="botTokenInput" style="color: white; display: block; margin-bottom: 5px;">Bot Token:</label>
-                    <input type="password" id="botTokenInput" value="${savedToken}" placeholder="Enter your bot token here"
-                           style="width: 100%; padding: 8px; border: 1px solid #36393f; border-radius: 4px; background: #424549; color: white;">
-                </div>
-                <div style="margin-bottom: 20px;">
-                    <label for="intentsInput" style="color: white; display: block; margin-bottom: 5px;">Gateway Intents (Bitmask):</label>
-                    <input type="number" id="intentsInput" value="${savedIntents}" placeholder="e.g., 3276799 for common intents"
-                           style="width: 100%; padding: 8px; border: 1px solid #36393f; border-radius: 4px; background: #424549; color: white;">
-                    <small style="color: #aaa;">Refer to Discord API docs for intent bitmasks.</small>
-                </div>
-                <div style="display: flex; justify-content: space-between;">
-                    <button id="connectBtn" style="padding: 10px 15px; background: #5865F2; color: white; border: none; border-radius: 5px; cursor: pointer;">Connect</button>
-                    <button id="disconnectBtn" style="padding: 10px 15px; background: #ED4245; color: white; border: none; border-radius: 5px; cursor: pointer;">Disconnect</button>
-                    <button id="closeModal" style="padding: 10px 15px; background: #424549; color: white; border: none; border-radius: 5px; cursor: pointer;">Close</button>
-                </div>
-            </div>
-        `;
-        document.body.appendChild(modal);
-
-        // Add event listeners after modal is in DOM
-        document.getElementById('connectBtn').onclick = () => {
-            const token = document.getElementById('botTokenInput').value.trim();
-            const intents = parseInt(document.getElementById('intentsInput').value) || 3276799; // Default all intents
-            if (token) {
-                localStorage.setItem('botlogin_token', token);
-                localStorage.setItem('botlogin_intents', intents);
-                this.connectAsBot(token, intents);
-                modal.remove(); // Close modal on connect attempt
-            } else {
-                alert('Please enter a bot token.');
-            }
-        };
-
-        document.getElementById('disconnectBtn').onclick = () => {
-            this.disconnectBot();
-            modal.remove(); // Close modal on disconnect
-        };
-
-        document.getElementById('closeModal').onclick = () => modal.remove();
-
-        // Click outside to close
-        modal.onclick = (e) => {
-            if (e.target === modal) modal.remove();
-        };
+    input: {
+        backgroundColor: "#424549",
+        color: "#ffffff",
+        borderRadius: 6,
+        paddingHorizontal: 12,
+        paddingVertical: 8,
+        marginBottom: 4,
+        borderWidth: 1,
+        borderColor: "#36393f",
+        fontSize: 14,
     },
+    row: {
+        flexDirection: "row",
+        justifyContent: "space-between",
+        marginTop: 20,
+        gap: 10,
+    },
+    btnConnect: {
+        flex: 1,
+        backgroundColor: "#5865F2",
+        paddingVertical: 12,
+        borderRadius: 6,
+        alignItems: "center",
+    },
+    btnDisconnect: {
+        flex: 1,
+        backgroundColor: "#ED4245",
+        paddingVertical: 12,
+        borderRadius: 6,
+        alignItems: "center",
+    },
+    btnText: {
+        color: "#ffffff",
+        fontWeight: "600",
+        fontSize: 14,
+    },
+    statusText: {
+        color: "#57F287",
+        fontSize: 13,
+        marginTop: 16,
+        textAlign: "center",
+    },
+    statusDisconnected: {
+        color: "#ED4245",
+    },
+    sectionTitle: {
+        color: "#ffffff",
+        fontSize: 18,
+        fontWeight: "700",
+        marginBottom: 16,
+    },
+});
 
-    // Connect to Discord Gateway as a bot
-    connectAsBot(token, intents) {
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-            console.warn('[BotLogin] Already connected');
-            alert('Already connected as a bot.');
-            return;
-        }
+// ─── Connection State (module-level, reset on unload) ─────────────────────────
+let ws = null;
+let heartbeatInterval = null;
+let sequence = null;
+let sessionId = null;
+let reconnectAttempts = 0;
+let isStopping = false;
+let gatewayUrl = null;
+let unpatchers = [];
 
-        console.log('[BotLogin] Connecting as bot...');
-        this.isStopping = false; // Ensure this is false when connecting
+// ─── Gateway Logic ────────────────────────────────────────────────────────────
 
-        // Get gateway URL first
-        fetch('https://discord.com/api/v10/gateway/bot', {
-            headers: {
-                'Authorization': `Bot ${token}`,
-                'Content-Type': 'application/json'
-            }
-        })
-        .then(res => {
-            if (!res.ok) {
-                return res.json().then(errorData => {
-                    throw new Error(errorData.message || 'Failed to fetch gateway URL.');
-                });
-            }
+function sendHeartbeat() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ op: 1, d: sequence }));
+    }
+}
+
+function startHeartbeat(interval) {
+    if (heartbeatInterval) clearInterval(heartbeatInterval);
+    sendHeartbeat();
+    heartbeatInterval = setInterval(sendHeartbeat, interval);
+}
+
+function resetConnectionState() {
+    if (heartbeatInterval) {
+        clearInterval(heartbeatInterval);
+        heartbeatInterval = null;
+    }
+    ws = null;
+    sequence = null;
+    sessionId = null;
+    reconnectAttempts = 0;
+    isStopping = false;
+}
+
+function sendIdentify(token, intents) {
+    ws.send(JSON.stringify({
+        op: 2,
+        d: {
+            token: token.startsWith("Bot ") ? token : `Bot ${token}`,
+            intents,
+            properties: { os: "android", browser: "BotLogin", device: "BotLogin" },
+            compress: false,
+            large_threshold: 250,
+        },
+    }));
+}
+
+function sendResume() {
+    const token = storage.botToken;
+    if (!token || !sessionId || sequence === null) {
+        connectAsBot(token, storage.intents);
+        return;
+    }
+    ws.send(JSON.stringify({
+        op: 6,
+        d: {
+            token: token.startsWith("Bot ") ? token : `Bot ${token}`,
+            session_id: sessionId,
+            seq: sequence,
+        },
+    }));
+}
+
+function handleDispatch(t, d) {
+    switch (t) {
+        case "READY":
+            sessionId = d.session_id;
+            reconnectAttempts = 0;
+            showToast(`✅ Connected as ${d.user.username}#${d.user.discriminator}`);
+            console.log("[BotLogin] READY:", d.user.username);
+            break;
+        case "MESSAGE_CREATE":
+            console.log(`[BotLogin] MSG #${d.channel_id} <${d.author.username}>: ${d.content}`);
+            break;
+    }
+}
+
+function handleGatewayMessage(data) {
+    const { op, d, s, t } = data;
+    if (s != null) sequence = s;
+
+    switch (op) {
+        case 0:  return handleDispatch(t, d);
+        case 1:  return sendHeartbeat();
+        case 7:  return reconnect(false);
+        case 9:
+            if (d) sendResume();
+            else   reconnect(true);
+            break;
+        case 10:
+            startHeartbeat(d.heartbeat_interval);
+            break;
+        case 11:
+            break; // heartbeat ACK
+    }
+}
+
+function handleDisconnect(code) {
+    if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
+
+    if (code === 1000 || isStopping) {
+        resetConnectionState();
+        return;
+    }
+
+    if (reconnectAttempts < 5) {
+        reconnectAttempts++;
+        const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+        setTimeout(() => reconnect(false), delay);
+    } else {
+        showToast("❌ Bot disconnected. Max reconnects reached.");
+        resetConnectionState();
+    }
+}
+
+function reconnect(forceIdentify) {
+    if (ws) { ws.close(); ws = null; }
+    const token = storage.botToken;
+    const intents = storage.intents;
+    if (!token) { resetConnectionState(); return; }
+
+    if (forceIdentify) {
+        sessionId = null; sequence = null;
+        connectAsBot(token, intents);
+    } else if (sessionId && sequence !== null && gatewayUrl) {
+        establishConnection(gatewayUrl, token, intents);
+    } else {
+        connectAsBot(token, intents);
+    }
+}
+
+function establishConnection(url, token, intents) {
+    gatewayUrl = url;
+    const fullUrl = url.startsWith("wss://") ? url : `wss://${url}`;
+    ws = new WebSocket(`${fullUrl}?v=10&encoding=json`);
+
+    ws.onopen    = () => sendIdentify(token, intents);
+    ws.onmessage = (e) => handleGatewayMessage(JSON.parse(e.data));
+    ws.onclose   = (e) => handleDisconnect(e.code);
+    ws.onerror   = (e) => console.error("[BotLogin] WS error:", e);
+}
+
+function connectAsBot(token, intents) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        showToast("⚠️ Already connected as a bot.");
+        return;
+    }
+    isStopping = false;
+
+    fetch("https://discord.com/api/v10/gateway/bot", {
+        headers: {
+            Authorization: `Bot ${token}`,
+            "Content-Type": "application/json",
+        },
+    })
+        .then((res) => {
+            if (!res.ok) return res.json().then((e) => { throw new Error(e.message); });
             return res.json();
         })
-        .then(data => {
-            if (data.url) {
-                this.establishConnection(data.url, token, intents);
-            } else {
-                throw new Error('No gateway URL provided in response.');
-            }
+        .then((data) => {
+            if (!data.url) throw new Error("No gateway URL in response");
+            establishConnection(data.url, token, intents);
         })
-        .catch(err => {
-            console.error('[BotLogin] Failed to get gateway URL:', err);
-            alert(`Failed to connect. Check your token and intents. Error: ${err.message}`);
+        .catch((err) => {
+            console.error("[BotLogin] Gateway fetch failed:", err);
+            showToast(`❌ Connect failed: ${err.message}`);
         });
-    },
+}
 
-    // Establish WebSocket connection
-    establishConnection(gatewayUrl, token, intents) {
-        const url = gatewayUrl.startsWith('wss://') ? gatewayUrl : `wss://${gatewayUrl}`;
-        this.ws = new WebSocket(`${url}?v=10&encoding=json`); // Ensure API version and encoding
+function disconnectBot() {
+    isStopping = true;
+    if (ws) ws.close(1000, "User disconnected");
+    resetConnectionState();
+    showToast("🔌 Bot disconnected.");
+}
 
-        this.ws.onopen = () => {
-            console.log('[BotLogin] WebSocket connected');
-            this.sendIdentify(token, intents);
-        };
-
-        this.ws.onmessage = (event) => {
-            this.handleGatewayMessage(JSON.parse(event.data));
-        };
-
-        this.ws.onclose = (event) => {
-            console.log('[BotLogin] WebSocket closed:', event.code, event.reason);
-            this.handleDisconnect(event.code);
-        };
-
-        this.ws.onerror = (error) => {
-            console.error('[BotLogin] WebSocket error:', error);
-            // Additional error handling could go here
-        };
-    },
-
-    // Send IDENTIFY payload
-    sendIdentify(token, intents) {
-        const identifyPayload = {
-            op: 2, // IDENTIFY
-            d: {
-                token: token.startsWith('Bot ') ? token : `Bot ${token}`, // Ensure 'Bot ' prefix
-                intents: intents,
-                properties: {
-                    os: 'linux', // Can be anything, but reflects a server environment more
-                    browser: 'BotLogin',
-                    device: 'BotLogin'
-                },
-                compress: false,
-                large_threshold: 250 // Max members in a guild to receive presence for
-            }
-        };
-
-        this.ws.send(JSON.stringify(identifyPayload));
-        console.log('[BotLogin] Sent IDENTIFY with intents:', intents);
-    },
-
-    // Handle incoming gateway messages
-    handleGatewayMessage(data) {
-        const { op, d, s, t } = data;
-
-        if (s) this.sequence = s; // Update sequence for resuming/heartbeats
-
-        switch (op) {
-            case 0: // DISPATCH
-                console.log('[BotLogin] Event:', t);
-                this.handleDispatch(t, d);
-                break;
-
-            case 1: // HEARTBEAT
-                console.log('[BotLogin] Received HEARTBEAT request from server');
-                this.sendHeartbeat();
-                break;
-
-            case 7: // RECONNECT
-                console.log('[BotLogin] Server requests reconnect');
-                this.reconnect();
-                break;
-
-            case 9: // INVALID SESSION
-                console.warn('[BotLogin] Invalid session, resumable:', d);
-                if (d) { // 'd' is true if session is resumable
-                    this.sendResume();
-                } else {
-                    console.error('[BotLogin] Non-resumable invalid session. Full reconnect.');
-                    this.reconnect(true); // Force a new IDENTIFY
-                }
-                break;
-
-            case 10: // HELLO
-                console.log('[BotLogin] Received HELLO. Heartbeat interval:', d.heartbeat_interval);
-                this.startHeartbeat(d.heartbeat_interval);
-                break;
-
-            case 11: // HEARTBEAT ACK
-                // console.log('[BotLogin] Heartbeat acknowledged'); // Too noisy for constant logging
-                break;
-
-            default:
-                console.log(`[BotLogin] Unhandled opcode ${op}:`, d);
-                break;
-        }
-    },
-
-    // Handle dispatch events
-    handleDispatch(event, data) {
-        switch (event) {
-            case 'READY':
-                console.log('[BotLogin] Ready! Bot:', data.user.username);
-                this.sessionId = data.session_id;
-                this.reconnectAttempts = 0; // Reset reconnect attempts on successful ready
-                alert(`Connected as ${data.user.username}#${data.user.discriminator}`);
-                // Here you might trigger UI updates or further bot logic
-                break;
-
-            case 'MESSAGE_CREATE':
-                // Log messages for demonstration
-                // Consider how to display these in the client UI for a better experience
-                console.log(`[BotLogin] Message in ${data.channel_id} from ${data.author.username}: ${data.content}`);
-                // Example: If you wanted to show this in the current channel (very basic, likely buggy):
-                // BdApi.ShowToast(`[BOT] ${data.author.username}: ${data.content}`, { type: "info" });
-                break;
-
-            // Add more event handlers as needed
-            // e.g., GUILD_CREATE, INTERACTION_CREATE (if you handle interactions)
-        }
-    },
-
-    // Start heartbeat interval
-    startHeartbeat(interval) {
-        console.log('[BotLogin] Starting heartbeat, interval:', interval);
-
-        if (this.heartbeatInterval) {
-            clearInterval(this.heartbeatInterval);
-        }
-
-        // Send first heartbeat immediately upon starting, then at interval
-        this.sendHeartbeat();
-        
-        this.heartbeatInterval = setInterval(() => {
-            this.sendHeartbeat();
-        }, interval);
-    },
-
-    // Send heartbeat
-    sendHeartbeat() {
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-            this.ws.send(JSON.stringify({
-                op: 1, // HEARTBEAT
-                d: this.sequence // Send the last sequence number received
-            }));
-            // console.log('[BotLogin] Sent heartbeat'); // Too noisy for constant logging
-        }
-    },
-
-    // Send RESUME payload
-    sendResume() {
-        const token = localStorage.getItem('botlogin_token');
-        if (!token || !this.sessionId || this.sequence === null) {
-            console.warn('[BotLogin] Cannot resume, missing token, session ID, or sequence. Reconnecting fully.');
-            this.reconnect(true); // Force full reconnect
-            return;
-        }
-
-        const resumePayload = {
-            op: 6, // RESUME
-            d: {
-                token: token.startsWith('Bot ') ? token : `Bot ${token}`,
-                session_id: this.sessionId,
-                seq: this.sequence
-            }
-        };
-
-        this.ws.send(JSON.stringify(resumePayload));
-        console.log('[BotLogin] Sent RESUME');
-    },
-
-    // Handle disconnect
-    handleDisconnect(code) {
-        if (this.heartbeatInterval) {
-            clearInterval(this.heartbeatInterval);
-            this.heartbeatInterval = null;
-        }
-
-        // Don't reconnect on clean close (1000) or if we're explicitly stopping
-        if (code === 1000 || this.isStopping) {
-            console.log('[BotLogin] Clean disconnect or plugin stopping, no reconnect.');
-            this.resetConnectionState();
-            return;
-        }
-
-        // Attempt reconnection for other codes (e.g., 1001, 1006, server restarts)
-        if (this.reconnectAttempts < 5) { // Limit reconnection attempts
-            this.reconnectAttempts++;
-            const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000); // Exponential backoff, max 30s
-            console.log(`[BotLogin] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}, code ${code})`);
-            setTimeout(() => this.reconnect(), delay);
-        } else {
-            console.error('[BotLogin] Max reconnect attempts reached. Giving up.');
-            alert('Bot disconnected and failed to reconnect after multiple attempts.');
-            this.resetConnectionState();
-        }
-    },
-
-    // Reconnect to gateway
-    reconnect(forceIdentify = false) {
-        if (this.ws) {
-            this.ws.close(); // Close existing connection before re-establishing
-            this.ws = null;
-        }
-        
-        const token = localStorage.getItem('botlogin_token');
-        const intents = parseInt(localStorage.getItem('botlogin_intents')) || 3276799;
-
-        if (!token) {
-            console.error('[BotLogin] No bot token found for reconnect.');
-            this.resetConnectionState();
-            return;
-        }
-
-        if (forceIdentify) {
-            console.log('[BotLogin] Forcing full IDENTIFY reconnect.');
-            this.sessionId = null; // Clear session ID to ensure a new IDENTIFY
-            this.sequence = null;
-            this.connectAsBot(token, intents);
-        } else if (this.sessionId && this.sequence !== null) {
-            console.log('[BotLogin] Attempting to RESUME session.');
-            this.establishConnection(localStorage.getItem('botlogin_gateway_url'), token, intents); // Need to store gateway URL
-        } else {
-            console.log('[BotLogin] No session to resume, performing full IDENTIFY reconnect.');
-            this.connectAsBot(token, intents);
-        }
-    },
-
-    // Disconnect bot
-    disconnectBot() {
-        this.isStopping = true; // Set flag to prevent reconnect attempts
-
-        if (this.ws) {
-            this.ws.close(1000, 'User disconnected'); // Clean close code
-        }
-
-        // Clear intervals and reset state
-        this.resetConnectionState();
-        
-        console.log('[BotLogin] Disconnected');
-        alert('Disconnected from bot session');
-    },
-
-    // Helper to reset connection-related state variables
-    resetConnectionState() {
-        if (this.heartbeatInterval) {
-            clearInterval(this.heartbeatInterval);
-        }
-        this.ws = null;
-        this.heartbeatInterval = null;
-        this.sessionId = null;
-        this.sequence = null;
-        this.reconnectAttempts = 0;
-        this.isStopping = false; // Reset to false after full stop/reset
-    },
-
-    // Patch token storage to prevent interference
-    patchTokenStorage() {
-        // This is a placeholder - actual implementation depends on the mod's internals
-        // and how it stores/retrieves the user token.
-        // The goal is to prevent the client from trying to use our bot token as a user token
-        // or overwriting our bot connection when the user client connects.
-        console.log('[BotLogin] Token storage patching logic would go here. This is complex.');
-        // Example (conceptual using BdApi.Patcher if available):
-        /*
-        const tokenModule = BdApi.Webpack.getModule(m => m.getToken && m.setToken);
-        if (tokenModule) {
-            this.originalTokenStorage = BdApi.Patcher.instead('BotLogin', tokenModule, 'getToken', (_, args, original) => {
-                // If we're connected as a bot, perhaps return null or a dummy token to prevent user client ops
-                if (this.ws && this.ws.readyState === WebSocket.OPEN) return null;
-                return original(...args); // Otherwise, let the client get its real user token
-            });
-            BdApi.Patcher.instead('BotLogin', tokenModule, 'setToken', (_, args, original) => {
-                // Prevent client from setting a user token if we're a bot
-                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                    console.warn('[BotLogin] Prevented user token overwrite while bot is active.');
-                    return;
-                }
-                return original(...args);
-            });
-        }
-        */
+// ─── Patching (optional token guard) ─────────────────────────────────────────
+function applyPatches() {
+    // Prevent the user-client token module from interfering while bot WS is live.
+    const tokenModule = findByProps("getToken");
+    if (tokenModule) {
+        unpatchers.push(
+            patcher.instead("BotLogin", tokenModule, "getToken", (_, _args, original) => {
+                // If our bot socket is alive, return null so Discord's normal
+                // user-client code doesn't try to reconnect over us.
+                if (ws && ws.readyState === WebSocket.OPEN) return null;
+                return original();
+            })
+        );
     }
+}
+
+// ─── Settings UI (React Native) ───────────────────────────────────────────────
+// Revenge renders the default-exported `settings` function/component inside its
+// plugin settings page. No DOM — use RN primitives only.
+function Settings() {
+    const [token, setToken]       = React.useState(storage.botToken ?? "");
+    const [intents, setIntents]   = React.useState(String(storage.intents ?? 3276799));
+    const [connected, setConnected] = React.useState(false);
+
+    // Sync connected state with actual WS
+    React.useEffect(() => {
+        const id = setInterval(() => {
+            setConnected(!!(ws && ws.readyState === WebSocket.OPEN));
+        }, 1000);
+        return () => clearInterval(id);
+    }, []);
+
+    function handleConnect() {
+        if (!token.trim()) {
+            showToast("⚠️ Please enter a bot token.");
+            return;
+        }
+        // Persist before connecting
+        storage.botToken = token.trim();
+        storage.intents  = parseInt(intents) || 3276799;
+        connectAsBot(storage.botToken, storage.intents);
+    }
+
+    function handleDisconnect() {
+        showConfirmationAlert({
+            title: "Disconnect Bot",
+            content: "Are you sure you want to disconnect the bot session?",
+            confirmText: "Disconnect",
+            confirmColor: "red",
+            onConfirm: disconnectBot,
+        });
+    }
+
+    return React.createElement(
+        ScrollView,
+        { style: styles.container },
+
+        React.createElement(Text, { style: styles.sectionTitle }, "🤖 BotLogin"),
+
+        React.createElement(Text, { style: styles.label }, "Bot Token"),
+        React.createElement(TextInput, {
+            style: styles.input,
+            value: token,
+            onChangeText: setToken,
+            placeholder: "Bot token (kept secure in storage)",
+            placeholderTextColor: "#888",
+            secureTextEntry: true,
+            autoCorrect: false,
+            autoCapitalize: "none",
+        }),
+
+        React.createElement(Text, { style: styles.label }, "Gateway Intents (bitmask)"),
+        React.createElement(TextInput, {
+            style: styles.input,
+            value: intents,
+            onChangeText: setIntents,
+            placeholder: "e.g. 3276799",
+            placeholderTextColor: "#888",
+            keyboardType: "numeric",
+        }),
+        React.createElement(Text, { style: styles.hint },
+            "Refer to the Discord API docs for intent bitmasks."
+        ),
+
+        React.createElement(
+            View,
+            { style: styles.row },
+            React.createElement(
+                TouchableOpacity,
+                { style: styles.btnConnect, onPress: handleConnect },
+                React.createElement(Text, { style: styles.btnText }, "Connect")
+            ),
+            React.createElement(
+                TouchableOpacity,
+                { style: styles.btnDisconnect, onPress: handleDisconnect },
+                React.createElement(Text, { style: styles.btnText }, "Disconnect")
+            )
+        ),
+
+        React.createElement(
+            Text,
+            { style: [styles.statusText, connected ? {} : styles.statusDisconnected] },
+            connected ? "● Bot is connected" : "● Not connected"
+        )
+    );
+}
+
+// ─── Plugin Lifecycle ─────────────────────────────────────────────────────────
+export default {
+    onLoad() {
+        console.log("[BotLogin] Loading…");
+        applyPatches();
+        // Auto-reconnect if a token was saved from a previous session
+        if (storage.botToken) {
+            connectAsBot(storage.botToken, storage.intents);
+        }
+        console.log("[BotLogin] Loaded.");
+    },
+
+    onUnload() {
+        console.log("[BotLogin] Unloading…");
+        isStopping = true;
+        if (ws) { ws.close(1000, "Plugin unloading"); ws = null; }
+        if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
+        // Remove all patches
+        unpatchers.forEach((up) => up());
+        unpatchers = [];
+        resetConnectionState();
+        console.log("[BotLogin] Unloaded.");
+    },
+
+    settings: Settings,
 };
