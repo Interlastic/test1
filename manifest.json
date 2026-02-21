@@ -4,5 +4,5 @@
   "description": "Enables and manages a Discord bot connection directly from the client. (Based on provided script).",
   "version": "1.0.0",
   "author": "YourNameOrAliasHere",
-  "main": "https://interlastic.github.io/test1/BotLogin.js"
+  "main": "BotLogin.js"
 }
