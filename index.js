@@ -8,7 +8,7 @@ const {
     },
     React,
     ReactNative: { View, Text, TextInput, TouchableOpacity, StyleSheet, ScrollView },
-} = window.vendetta;
+} = window.bunny;
 
 const storage = createProxy({
     botToken: "",
